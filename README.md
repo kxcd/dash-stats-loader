@@ -1,5 +1,6 @@
 # dash-stats-loader
-backed stats loader
+Backend stats loader.
+
 This is a backend to create a sqlite database with some network statistics, ideally install it to ~/bin as a non-privlieged user, assume 'dash', then add the following line to crontab to call it periodically.
 
     */20 * * * *  nice -19 ~/bin/dash_stats_loader.sh >>~/dash_stats_loader.log  2>&1
