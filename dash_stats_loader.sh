@@ -1,12 +1,12 @@
 #!/bin/bash
 #set -x
 
-VERSION="$0 (v0.2.2 build date 202111190000)"
+VERSION="$0 (v0.2.5 build date 202203200000)"
 DATABASE_VERSION=1
 DATADIR="$HOME/.dash_stats_loader"
 
 dcli () {
-	dash-cli -datadir=/tmp -rpcuser=rpcuser -rpcpassword=rpcpassword "$@"
+	dash-cli -datadir=/tmp -conf=/etc/dash.conf "$@"
 }
 
 
@@ -116,7 +116,6 @@ initialise_database(){
 		#			tx_rate						-	The average number of transactions per second seen in the last hour.
 		#			collateralised_masternodes	-	The number of masternodes locking away 1000 DASH.
 		#			enabled_masternodes			-	The number of masternodes that are actually running.
-#		#			roi							-	The forward looking return on investment for running a masternode.
 		#			price_usd					-	Sourced from coinpaprika.
 		#			price_btc					-	Sourced from coinpaprika.
 		#			price_usd_24hr_change		-	The percent gain/loss in the USD price in the last 24 hours.
@@ -163,13 +162,13 @@ check_and_upgrade_database(){
 		execute_sql "delete from stats where run_date in (select run_date from loading);"
 	fi
 	echo "[$$] Checking integrity of the database..."
-	retval=$(execute_sql "PRAGMA main.integrity_check;")
+	retval=$(sqlite3 "$DATABASE_FILE" <<< "PRAGMA main.integrity_check;" 2>>"$DATADIR"/logs/sqlite.log)
 	if [[ "$retval" != "ok" ]];then
 		echo -e "[$$] Database integrity check failed.\n$retval\nExiting..."
 		exit 6
 	fi
 	echo "[$$] Checking the foreign keys in the database..."
-	retval=$(execute_sql "PRAGMA main.foreign_key_check;")
+	retval=$(sqlite3 "$DATABASE_FILE" <<< "PRAGMA main.foreign_key_check;" 2>>"$DATADIR"/logs/sqlite.log)
 	if (( ${#retval} != 0 ));then
 		echo "[$$] There are some errors with foreign keys in this database, exiting..."
 		exit 7
@@ -211,6 +210,8 @@ set -e
 # Use the same names as the database fields.
 
 run_date=$(date +"%Y%m%d%H%M%S")
+echo "[$$} Run date is $run_date."
+
 echo "[$$] Fetching block height..."
 height=$(dcli getblockcount)
 
@@ -253,53 +254,9 @@ diff_time=$((current_time - previous_time))
 tx_rate=$(printf '%0.4f' $(bc<<<"scale=6;$num_txes / $diff_time"))
 
 echo "[$$] Fetching masternode counts..."
-collateralised_masternodes=$(dcli masternode count|jq .total)
-enabled_masternodes=$(dcli masternode count|jq .enabled)
-
-
-
-
-# echo "[$$] Calculating the yearly ROI..."
-# # Variables for calculating the yearly ROI
-# FIRST_REALLOC=1379128
-# BLOCK_TIME=2.625
-# SUPER_BLOCK_CYCLE=16616
-# HALVING_INTERVAL=210240
-# FIRST_REWARD_BLOCK=1261441
-# HALVING_REDUCTION_AMOUNT="1/14"
-# STARTING_BLOCK_REWARD=1.44236248
-# REALLOC_AMOUNT=(513 526 533 540 546 552 557 562 567 572 577 582 585 588 591 594 597 599 600)
-
-# current_block=$height
-
-# blocks_per_year=$(printf '%.0f' $(bc<<<"scale=4;60/$BLOCK_TIME*24*365.25"))
-# last_block_of_the_year=$((current_block+blocks_per_year))
-
-
-# # General idea compute the reward for every n blocks and accumulate it.
-# # where n is the number of enabled MNs.
-# reward=0
-# for((block=current_block; block<last_block_of_the_year; block+=enabled_masternodes));do
-
-	# # Find which halving period we are on
-	# blocks_since_halving=$((block-FIRST_REWARD_BLOCK))
-	# halving_period=$((blocks_since_halving/HALVING_INTERVAL))
-
-	# # Find which realloc period we are on.
-	# blocks_since_realloc=$((block-FIRST_REALLOC))
-	# # We start counting our periods from zero, each realloc period lasts for 3 super blocks.
-	# period=$((blocks_since_realloc/(SUPER_BLOCK_CYCLE*3)))
-	# if ((period>18));then
-		# period=18
-	# fi
-
-	# # Combined bc statement.
-	# reward=$(echo "scale=8;base_reward=$STARTING_BLOCK_REWARD * (1 - $HALVING_REDUCTION_AMOUNT)^$halving_period;new_reward=base_reward / 500 * ${REALLOC_AMOUNT[$period]};$reward+new_reward"|bc -l)
-# done
-
-# roi=$(bc<<<"scale=2;$reward/10")
-# roi=$(printf "%.2f" "$roi")
-
+mn_count=$(dcli masternode count)
+collateralised_masternodes=$(jq .total <<< "$mn_count")
+enabled_masternodes=$(jq .enabled <<< "$mn_count")
 
 
 echo "[$$] Fetching price data..."
@@ -319,11 +276,25 @@ fi
 
 
 set +e
+
+loading_count=$(execute_sql "select count(1) from loading;")
+((loading_count >0))&&{ echo "[$$] The database is already busy, aborting!";exit 99;}
+execute_sql "insert into loading values($run_date);"||\
+{ echo "[$$] Failed to update loading table, aborting.";exit 98;}
+
+sleep 5
+loading_count=$(execute_sql "select count(1) from loading;")
+if ((loading_count >1));then
+	echo "[$$] Another process is trying to update the database AT THE SAME TIME! Aborting!"
+	execute_sql "delete from loading where run_date=$run_date;"
+	exit 99
+fi
+
 # Create the sql statements to load the data, but because gathering the data takes so long and we want to minimise the chance
 # of getting killed while loading, the array of sql statements will be run at the end when all the data is gathered.
 sql="begin transaction;"
 sql+="insert into stats (run_date,height,chainlocked_YN,chainlock_lag,difficulty_mega,supply_mega,mempool_txes,mempool_size_kb,tx_rate,collateralised_masternodes,enabled_masternodes,price_usd,price_btc,price_usd_24hr_change)values($run_date,$height,\"$chainlocked_YN\",$chainlock_lag,$difficulty_mega,$supply_mega,$mempool_txes,$mempool_size_kb,$tx_rate,$collateralised_masternodes,$enabled_masternodes,$price_usd,$price_btc,$price_usd_24hr_change);"
-sql+="insert into loading values($run_date);commit;"
+sql+="commit;"
 sql_array[0]="$sql"
 sql=""
 
@@ -370,7 +341,9 @@ if ((${#sql} > 0));then
 	sql_array[$j]="begin transaction; $sql commit;"
 	((j++))
 fi
-sql_array[$j]="delete from loading where run_date=$run_date;"
+## Moved to later in the script, however, this moves it out of this trap and so it is possible
+## that over a reboot, the table has stale data.
+#sql_array[$j]="delete from loading where run_date=$run_date;"
 echo -e "\n[$$] Done Parsing masternode data in $((EPOCHSECONDS - start_time)) seconds..."
 
 
@@ -380,6 +353,7 @@ start_time=$EPOCHSECONDS
 for((j=0;j<${#sql_array[*]};j++));do
 	echo -n "#"
 	execute_sql "${sql_array[$j]}"
+	(($? != 0))&&{ echo "[$$] Insert of data failed, aborting !";exit 88;}
 done
 echo -e "\n[$$] Done Loading masternodes database in $((EPOCHSECONDS - start_time)) seconds..."
 [[ -n $got_sig ]]&& exit 8
@@ -403,7 +377,7 @@ deletions=$(execute_sql "select count(1) from masternodes a where a.run_date=(se
 ((changes=additions+deletions))
 
 trap 'catch_sig' SIGTERM SIGINT SIGHUP
-if((changes>0));then
+if ((changes>0));then
 	echo "[$$] New data detected, keeping $additions addition(s) and $deletions deletion(s)..."
 else
 	echo "[$$] No changes, purging new data..."
@@ -411,10 +385,11 @@ else
 #	echo "[$$] Doing a VACUUM..."
 #	execute_sql "vacuum;"
 fi
+execute_sql "delete from loading where run_date=$run_date;"
 [[ -n $got_sig ]]&& exit 9
 trap - SIGTERM SIGINT SIGHUP
 
-if((changes>0));then
+if ((changes>0));then
 	# Now place a copy in /var/www/html/dash-stats/
 	# Do it in two steps so the database is not being written too while copying over, the mv is instant.
 	cp "$DATABASE_FILE" /var/www/html/dash-stats/ && mv -f /var/www/html/dash-stats/$(basename "$DATABASE_FILE") /var/www/html/dash-stats/.stats.db
