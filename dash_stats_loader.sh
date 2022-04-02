@@ -1,7 +1,7 @@
 #!/bin/bash
 #set -x
 
-VERSION="$0 (v0.2.5 build date 202203200000)"
+VERSION="$0 (v0.2.7 build date 202204021800)"
 DATABASE_VERSION=1
 DATADIR="$HOME/.dash_stats_loader"
 
@@ -128,7 +128,7 @@ initialise_database(){
 		sql="PRAGMA foreign_keys = ON;"
 		sql+="create table db_version(version integer primary key not null);"
 		sql+="insert into db_version values(1);"
-		sql+="create table STATS(run_date INTEGER PRIMARY KEY ASC NOT NULL, height INTEGER NOT NULL check(height>=0),chainlocked_YN text not null ,chainlock_lag integer not null,difficulty_mega real not null check(difficulty_mega>=0), supply_mega real not null check(supply_mega>=0), mempool_txes integer not null check(mempool_txes>=0), mempool_size_kb real not null check(mempool_size_kb>=0), tx_rate real not null check(tx_rate>=0), collateralised_masternodes integer not null check(collateralised_masternodes>=0), enabled_masternodes integer not null check(enabled_masternodes>=0), price_usd real not null check(price_usd>=0), price_btc real not null check(price_btc>=0), price_usd_24hr_change real not null);"
+		sql+="create table STATS(run_date INTEGER PRIMARY KEY ASC NOT NULL, height INTEGER NOT NULL check(height>=0),chainlocked_YN text not null ,chainlock_lag integer not null,difficulty_mega real not null check(difficulty_mega>=0), supply_mega real not null check(supply_mega>=0), mempool_txes integer not null check(mempool_txes>=0), mempool_size_kb real not null check(mempool_size_kb>=0), tx_rate real not null check(tx_rate>=0), collateralised_masternodes integer not null check(collateralised_masternodes>=0), enabled_masternodes integer not null check(enabled_masternodes>=0), price_usd real not null check(price_usd>=0), price_btc real not null check(price_btc>=0), price_usd_24hr_change real not null, mn_days real not null);"
 		sql+="create unique index idx_run_date on STATS(run_date);"
 		# The ON DELETE CASCADE clause does the same thing as this trigger, however it only works when the PRAGMA foreign_keys=on; is 1
 		# which resets back to 0 on a new session.
@@ -159,7 +159,7 @@ check_and_upgrade_database(){
 	count=$(execute_sql "select count(1) from loading;")
 	if ((count > 0));then
 		echo "[$$] Clean $count stale run(s)."
-		execute_sql "delete from stats where run_date in (select run_date from loading);"
+		execute_sql "delete from stats where run_date in (select run_date from loading);select changes();"
 	fi
 	echo "[$$] Checking integrity of the database..."
 	retval=$(sqlite3 "$DATABASE_FILE" <<< "PRAGMA main.integrity_check;" 2>>"$DATADIR"/logs/sqlite.log)
@@ -259,6 +259,17 @@ collateralised_masternodes=$(jq .total <<< "$mn_count")
 enabled_masternodes=$(jq .enabled <<< "$mn_count")
 
 
+
+
+echo "[$$] Fetching masternode days..."
+protx_list=$(dcli protx list valid 1)
+mn_days=$(jq '.[].state.registeredHeight'<<<"$protx_list"| awk -v height="$height" '{sum+=height-$1}END{print sum/NR*2.625/60/24}')
+
+
+
+
+
+
 echo "[$$] Fetching price data..."
 
 
@@ -293,7 +304,7 @@ fi
 # Create the sql statements to load the data, but because gathering the data takes so long and we want to minimise the chance
 # of getting killed while loading, the array of sql statements will be run at the end when all the data is gathered.
 sql="begin transaction;"
-sql+="insert into stats (run_date,height,chainlocked_YN,chainlock_lag,difficulty_mega,supply_mega,mempool_txes,mempool_size_kb,tx_rate,collateralised_masternodes,enabled_masternodes,price_usd,price_btc,price_usd_24hr_change)values($run_date,$height,\"$chainlocked_YN\",$chainlock_lag,$difficulty_mega,$supply_mega,$mempool_txes,$mempool_size_kb,$tx_rate,$collateralised_masternodes,$enabled_masternodes,$price_usd,$price_btc,$price_usd_24hr_change);"
+sql+="insert into stats (run_date,height,chainlocked_YN,chainlock_lag,difficulty_mega,supply_mega,mempool_txes,mempool_size_kb,tx_rate,collateralised_masternodes,enabled_masternodes,price_usd,price_btc,price_usd_24hr_change,mn_days)values($run_date,$height,\"$chainlocked_YN\",$chainlock_lag,$difficulty_mega,$supply_mega,$mempool_txes,$mempool_size_kb,$tx_rate,$collateralised_masternodes,$enabled_masternodes,$price_usd,$price_btc,$price_usd_24hr_change,$mn_days);"
 sql+="commit;"
 sql_array[0]="$sql"
 sql=""
@@ -366,7 +377,7 @@ unset sql_array
 
 
 
-
+start_time=$EPOCHSECONDS
 echo "[$$] Checking masternodes database for differences..."
 # Additions...
 additions=$(execute_sql "select count(1) from masternodes a where a.run_date=(select max(run_date) from masternodes) and not exists (select 1 from masternodes b where b.collateral_hash=a.collateral_hash and a.collateral_hash_index=b.collateral_hash_index and b.run_date=(select run_date from(SELECT distinct run_date, dense_rank() over (order by run_date desc)date_rank FROM masternodes)where date_rank=2));")
@@ -375,6 +386,8 @@ additions=$(execute_sql "select count(1) from masternodes a where a.run_date=(se
 deletions=$(execute_sql "select count(1) from masternodes a where a.run_date=(select run_date from(SELECT distinct run_date, dense_rank() over (order by run_date desc)date_rank FROM masternodes)where date_rank=2) and not exists (select 1 from masternodes b where b.collateral_hash=a.collateral_hash and a.collateral_hash_index=b.collateral_hash_index and b.run_date=(select max(run_date) from masternodes));")
 
 ((changes=additions+deletions))
+
+echo "[$$] Done in $((EPOCHSECONDS - start_time)) seconds..."
 
 trap 'catch_sig' SIGTERM SIGINT SIGHUP
 if ((changes>0));then
@@ -395,9 +408,12 @@ if ((changes>0));then
 	cp "$DATABASE_FILE" /var/www/html/dash-stats/ && mv -f /var/www/html/dash-stats/$(basename "$DATABASE_FILE") /var/www/html/dash-stats/.stats.db
 
 	# This will be a good time to take a backup of the database.
+	start_time=$EPOCHSECONDS
+	echo "[$$] Backing up the database..."
 	BACKUP_DB="$(dirname "$DATABASE_FILE")/"$run_date"_stats.db"
 	cp "$DATABASE_FILE" "$BACKUP_DB"
 	xz -eT5 "$BACKUP_DB" >/dev/null 2>&1
+	echo "[$$] Done in $((EPOCHSECONDS - start_time)) seconds..."
 fi
 echo "[$$] $0 exiting..."
 
