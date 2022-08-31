@@ -1,14 +1,15 @@
 #!/bin/bash
 #set -x
 
-VERSION="$0 (v0.2.7 build date 202204021800)"
-DATABASE_VERSION=1
+VERSION="$0 (v0.3.0 build date 202208311800)"
+DATABASE_VERSION=2
 DATADIR="$HOME/.dash_stats_loader"
 
 dcli () {
 	dash-cli -datadir=/tmp -conf=/etc/dash.conf "$@"
 }
 
+pidof -q -x -o $$ $(basename "$0")&&exit
 
 usage(){
 	text="$VERSION\n"
@@ -31,7 +32,7 @@ while (( $# > 0 ));do
 			exit 0
 			;;
 		-datadir)
-			DATADIR="$2"
+			datadir="$2"
 			shift;shift
 			;;
 		*)
@@ -121,20 +122,22 @@ initialise_database(){
 		#			price_usd_24hr_change		-	The percent gain/loss in the USD price in the last 24 hours.
 		#
 		# masternodes				-	Stores a snapshot of the masternode network at that point in time.
+		# masternode_id_run_date	-	Stores the run_date and the masternode id only.
 		#
 		# loading					-	Stores the data of the current load and indicates incomplete data.
 		#			run_date					-	If not null, then the data for that date is incomplete.
 		#
 		sql="PRAGMA foreign_keys = ON;"
 		sql+="create table db_version(version integer primary key not null);"
-		sql+="insert into db_version values(1);"
+		sql+="insert into db_version values(2);"
 		sql+="create table STATS(run_date INTEGER PRIMARY KEY ASC NOT NULL, height INTEGER NOT NULL check(height>=0),chainlocked_YN text not null ,chainlock_lag integer not null,difficulty_mega real not null check(difficulty_mega>=0), supply_mega real not null check(supply_mega>=0), mempool_txes integer not null check(mempool_txes>=0), mempool_size_kb real not null check(mempool_size_kb>=0), tx_rate real not null check(tx_rate>=0), collateralised_masternodes integer not null check(collateralised_masternodes>=0), enabled_masternodes integer not null check(enabled_masternodes>=0), price_usd real not null check(price_usd>=0), price_btc real not null check(price_btc>=0), price_usd_24hr_change real not null, mn_days real not null);"
 		sql+="create unique index idx_run_date on STATS(run_date);"
-		# The ON DELETE CASCADE clause does the same thing as this trigger, however it only works when the PRAGMA foreign_keys=on; is 1
-		# which resets back to 0 on a new session.
-		sql+="create table masternodes(run_date integer not null, protx_hash text not null, collateral_hash text not null, collateral_hash_index integer not null,ip text not null, port integer not null check(port>=0 and port<65536),status text not null check(status in('E','P','U')),owneraddress text not null,voting_key text not null, payout_address text not null,collateral_address text not null, foreign key(run_date)references stats(run_date) on delete cascade, primary key(run_date, protx_hash));"
+		sql+="CREATE TABLE masternodes(id integer primary key asc not null, protx_hash text not null, collateral_hash text not null, collateral_hash_index integer not null,ip text not null, port integer not null check(port>=0 and port<65536),status text not null check(status in('E','P','U')),owner_address text not null,voting_address text not null, payout_address text not null,collateral_address text not null);"
 		# This index is handy to have, but strictly not needed to run the PHP site.
-		sql+="CREATE UNIQUE INDEX idx_collateral_hash_index on MASTERNODES(run_date,collateral_hash,collateral_hash_index);"
+		sql+="CREATE INDEX idx_collateral_hash_index on MASTERNODES(collateral_hash,collateral_hash_index);"
+		sql+="CREATE TABLE masternode_id_run_date(id int not null, run_date int not null, primary key(id,run_date),foreign key(id)references masternodes,foreign key(run_date)references stats(run_date));"
+		sql+="CREATE INDEX idx_run_date_masternode_id_run_date on masternode_id_run_date(run_date);"
+		sql+="create index idx_masternodes_id_run_date_id on masternode_id_run_date(id);"
 		sql+="create table loading(run_date integer, foreign key(run_date)references stats(run_date),primary key(run_date));"
 		execute_sql "$sql"
 		if (( $? != 0 ));then
@@ -159,7 +162,16 @@ check_and_upgrade_database(){
 	count=$(execute_sql "select count(1) from loading;")
 	if ((count > 0));then
 		echo "[$$] Clean $count stale run(s)."
-		execute_sql "delete from stats where run_date in (select run_date from loading);select changes();"
+		deleted=$(execute_sql "delete from stats where run_date in (select run_date from loading);select changes();")
+		echo "[$$] Deleted $deleted records in the stats table..."
+		# To delete this run, we have to do a reference count to the data, if the id is used more than once, then do not delete the data from masternodes table.
+		# Find all masternode records that are referenced once only, then select those that are also from this run_date and delete them.
+		deleted=$(execute_sql "delete from masternodes where id in (select id from masternode_id_run_date where run_date in (select run_date from loading) and id in(select id from masternode_id_run_date group by id having count(1)=1));select changes();")
+		echo "[$$] Deleted $deleted records from masternodes..."
+		deleted=$(execute_sql "delete from masternode_id_run_date where run_date in (select run_date from loading);select changes();")
+		echo "[$$] Deleted $deleted records from masternode_id_run_date..."
+		deleted=$(execute_sql "delete from loading;select changes();")
+		echo "[$$] Deleted $deleted records from loading..."
 	fi
 	echo "[$$] Checking integrity of the database..."
 	retval=$(sqlite3 "$DATABASE_FILE" <<< "PRAGMA main.integrity_check;" 2>>"$DATADIR"/logs/sqlite.log)
@@ -173,15 +185,31 @@ check_and_upgrade_database(){
 		echo "[$$] There are some errors with foreign keys in this database, exiting..."
 		exit 7
 	fi
-	pages=$(execute_sql "select count(1) from statS;")
-	mn_pages=$(execute_sql "select count(distinct run_date) from masternodes;")
-	echo "[$$] Database is up to date and contains a record of $pages snapshot(s) and $mn_pages masternode snapshot(s)." >&2
+	missing=$(execute_sql "select count(1) from masternodes a where not exists (select 1 from masternode_id_run_date b where a.id=b.id);")
+	((missing>0))&&{ echo "[$$] There are $missing records in the masternodes table.";exit 2;}
+	missing=$(execute_sql "select count(1) from masternode_id_run_date a where not exists (select 1 from masternodes b where a.id=b.id);")
+	((missing>0))&&{ echo "[$$] There are $missing records in the masternode_id_run_date table.";exit 2;}
+	pages=$(execute_sql "select count(1) from stats;")
+	mn_pages=$(execute_sql "select count(distinct run_date) from masternode_id_run_date;")
+	masternodes=$(execute_sql "select count(1) from masternodes;")
+	echo "[$$] Database is up to date and contains a record of $pages snapshot(s) and $mn_pages masternode snapshot(s) and $masternodes distinct masternode versions." >&2
 }
 
-
+# Cleanup gracefully in case of an interruption.
 catch_sig(){
-
-	got_sig='X'
+	echo -e "\n[$$] Caught signal, cleaning up and exiting..."
+	start_time=$EPOCHSECONDS
+	deleted=$(execute_sql "delete from stats where run_date=$run_date;select changes();")
+	echo "[$$] Deleted $deleted records from stats..."
+	# To delete this run, we have to do a reference count to the data, if the id is used more than once, then do not delete the data from masternodes table.
+	# Find all masternode records that are referenced once only, then select those that are also from this run_date and delete them.
+	deleted=$(execute_sql "delete from masternodes where id in (select id from masternode_id_run_date where run_date=$run_date and id in(select id from masternode_id_run_date group by id having count(1)=1));select changes();")
+	echo "[$$] Deleted $deleted records from masternodes..."
+	deleted=$(execute_sql "delete from masternode_id_run_date where run_date=$run_date;select changes();")
+	echo "[$$] Deleted $deleted records from masternode_id_run_date..."
+	execute_sql "delete from loading;"
+	echo "[$$] Purge completed in $((EPOCHSECONDS - start_time)) seconds."
+	exit 0
 }
 
 
@@ -228,7 +256,7 @@ chainlocked_YN=$(if [ $(jq -r '.chainlock' <<<$block) = "true" ];then echo "Y";e
 echo "[$$] Computing ChainLock lag..."
 # It is possible to get a negative chainlock lag here, that is because of the forced delay (see above) we may be chainlocking on more recent block.
 # So, a lag of <=0 means the current block $height is for sure chainlocked.
-chainlock_lag=$(($height-$(dcli getbestchainlock|jq -r '.height')))
+chainlock_lag=$((height-$(dcli getbestchainlock|jq -r '.height')))
 [[ -z $chainlock_lag ]] && exit 1
 
 echo "[$$] Fetching mempool tx count..."
@@ -244,7 +272,7 @@ previous_time=$current_time
 _height=$height
 
 #  Go back in time for at least 1 hour (3600 seconds) of block time and sum the number of TXes during that time.
-until (( $previous_time <= $((current_time-3600)) ));do
+until (( previous_time <= $((current_time-3600)) ));do
 	((_height--))
 	_block=$(dcli getblock $(dcli getblockhash $_height))
 	previous_time=$(jq -r '.time' <<<$_block)
@@ -258,7 +286,8 @@ mn_count=$(dcli masternode count)
 collateralised_masternodes=$(jq .total <<< "$mn_count")
 enabled_masternodes=$(jq .enabled <<< "$mn_count")
 
-
+# Collect the masternode data, but it gets used a little later.
+masternodes=$(dcli masternode list)
 
 
 echo "[$$] Fetching masternode days..."
@@ -286,7 +315,11 @@ else
 fi
 
 
+
 set +e
+
+# Use signal trap to roll back the database changes.
+trap 'catch_sig' SIGTERM SIGINT SIGHUP
 
 loading_count=$(execute_sql "select count(1) from loading;")
 ((loading_count >0))&&{ echo "[$$] The database is already busy, aborting!";exit 99;}
@@ -301,24 +334,16 @@ if ((loading_count >1));then
 	exit 99
 fi
 
-# Create the sql statements to load the data, but because gathering the data takes so long and we want to minimise the chance
-# of getting killed while loading, the array of sql statements will be run at the end when all the data is gathered.
-sql="begin transaction;"
-sql+="insert into stats (run_date,height,chainlocked_YN,chainlock_lag,difficulty_mega,supply_mega,mempool_txes,mempool_size_kb,tx_rate,collateralised_masternodes,enabled_masternodes,price_usd,price_btc,price_usd_24hr_change,mn_days)values($run_date,$height,\"$chainlocked_YN\",$chainlock_lag,$difficulty_mega,$supply_mega,$mempool_txes,$mempool_size_kb,$tx_rate,$collateralised_masternodes,$enabled_masternodes,$price_usd,$price_btc,$price_usd_24hr_change,$mn_days);"
-sql+="commit;"
-sql_array[0]="$sql"
-sql=""
+sql="insert into stats (run_date,height,chainlocked_YN,chainlock_lag,difficulty_mega,supply_mega,mempool_txes,mempool_size_kb,tx_rate,collateralised_masternodes,enabled_masternodes,price_usd,price_btc,price_usd_24hr_change,mn_days)values($run_date,$height,\"$chainlocked_YN\",$chainlock_lag,$difficulty_mega,$supply_mega,$mempool_txes,$mempool_size_kb,$tx_rate,$collateralised_masternodes,$enabled_masternodes,$price_usd,$price_btc,$price_usd_24hr_change,$mn_days);"
+execute_sql "$sql"
 
 
-# Now collect the masternode data.
-masternodes=$(dcli masternode list)
-echo "[$$] Parsing masternode data..."
+echo "[$$] Loading masternodes database..."
 start_time=$EPOCHSECONDS
-j=1
+
 key=0
 collateral_hashes_array=($(jq -r 'keys_unsorted[]'<<<"$masternodes"))
-while read proTxHash address status owneraddress votingaddress payee collateraladdress rest;do
-	echo -n "#"
+while read proTxHash address status owner_address voting_address payee collateraladdress rest;do
 	case $status in
 		ENABLED)
 			status="E"
@@ -341,65 +366,59 @@ while read proTxHash address status owneraddress votingaddress payee collaterala
 	collateral_hash=${collateral_hashes_array[$key]%-*}
 	collateral_hash_index=${collateral_hashes_array[$key]#*-}
 	((key++))
-	sql+="insert into masternodes(run_date,protx_hash,collateral_hash,collateral_hash_index,ip,port,status,owneraddress,voting_key,payout_address,collateral_address)values($run_date,\"$proTxHash\",\"$collateral_hash\",$collateral_hash_index,\"$ip\",$port,\"$status\",\"$owneraddress\",\"$votingaddress\",\"$payee\",\"$collateraladdress\");"
-	if ((${#sql} > 100000));then
-		sql_array[$j]="begin transaction; $sql commit;"
-		((j++))
-		sql=""
-	fi
-done  < <(jq -r '.[]|"\(.proTxHash) \(.address) \(.status) \(.owneraddress) \(.votingaddress) \(.payee) \(.collateraladdress)"'<<<"$masternodes")
-if ((${#sql} > 0));then
-	sql_array[$j]="begin transaction; $sql commit;"
-	((j++))
-fi
-## Moved to later in the script, however, this moves it out of this trap and so it is possible
-## that over a reboot, the table has stale data.
-#sql_array[$j]="delete from loading where run_date=$run_date;"
-echo -e "\n[$$] Done Parsing masternode data in $((EPOCHSECONDS - start_time)) seconds..."
 
-
-echo "[$$] Loading masternodes database..."
-trap 'catch_sig' SIGTERM SIGINT SIGHUP
-start_time=$EPOCHSECONDS
-for((j=0;j<${#sql_array[*]};j++));do
+	while :;do
+		sql="select id from masternodes where protx_hash='$proTxHash' and collateral_hash='$collateral_hash' and collateral_hash_index=$collateral_hash_index and ip='$ip' and port=$port and status='$status' and owner_address='$owner_address' and voting_address='$voting_address' and payout_address='$payee' and collateral_address='$collateraladdress';"
+		id=$(execute_sql "$sql")
+		if [[ $id == "" ]];then
+			echo -n "*"
+			execute_sql "insert into masternodes(protx_hash,collateral_hash,collateral_hash_index,ip,port,status,owner_address,voting_address,payout_address,collateral_address) values('$proTxHash','$collateral_hash',$collateral_hash_index,'$ip',$port,'$status','$owner_address','$voting_address','$payee','$collateraladdress');"
+		else
+			break;
+		fi
+	done
 	echo -n "#"
-	execute_sql "${sql_array[$j]}"
-	(($? != 0))&&{ echo "[$$] Insert of data failed, aborting !";exit 88;}
-done
+	execute_sql "insert into masternode_id_run_date values($id,$run_date);"
+done  < <(jq -r '.[]|"\(.proTxHash) \(.address) \(.status) \(.owneraddress) \(.votingaddress) \(.payee) \(.collateraladdress)"'<<<"$masternodes")
+
 echo -e "\n[$$] Done Loading masternodes database in $((EPOCHSECONDS - start_time)) seconds..."
-[[ -n $got_sig ]]&& exit 8
-# Signal is reset to default action so program can terminate immediately until the DB is accessed again.
-trap - SIGTERM SIGINT SIGHUP
-unset sql_array
 
 
 
 
 
-
-start_time=$EPOCHSECONDS
 echo "[$$] Checking masternodes database for differences..."
-# Additions...
-additions=$(execute_sql "select count(1) from masternodes a where a.run_date=(select max(run_date) from masternodes) and not exists (select 1 from masternodes b where b.collateral_hash=a.collateral_hash and a.collateral_hash_index=b.collateral_hash_index and b.run_date=(select run_date from(SELECT distinct run_date, dense_rank() over (order by run_date desc)date_rank FROM masternodes)where date_rank=2));")
+start_time=$EPOCHSECONDS
 
-# Deletions...
-deletions=$(execute_sql "select count(1) from masternodes a where a.run_date=(select run_date from(SELECT distinct run_date, dense_rank() over (order by run_date desc)date_rank FROM masternodes)where date_rank=2) and not exists (select 1 from masternodes b where b.collateral_hash=a.collateral_hash and a.collateral_hash_index=b.collateral_hash_index and b.run_date=(select max(run_date) from masternodes));")
+additions=$(execute_sql "select count(1) from masternode_id_run_date a join masternodes b on a.id=b.id where a.run_date=(select max(run_date) from masternode_id_run_date) and not exists (select 1 from masternodes c join masternode_id_run_date d on c.id=d.id where b.collateral_hash=c.collateral_hash and b.collateral_hash_index=c.collateral_hash_index and d.run_date=(select run_date from(SELECT distinct run_date, dense_rank() over (order by run_date desc)date_rank FROM masternode_id_run_date)where date_rank=2));")
+
+deletions=$(execute_sql "select count(1) from masternode_id_run_date a join masternodes b on a.id=b.id where a.run_date=(select run_date from(SELECT distinct run_date, dense_rank() over (order by run_date desc)date_rank FROM masternode_id_run_date)where date_rank=2) and not exists (select 1 from masternodes c join masternode_id_run_date d on c.id=d.id where c.collateral_hash=b.collateral_hash and b.collateral_hash_index=c.collateral_hash_index and d.run_date=(select max(run_date) from masternode_id_run_date));")
 
 ((changes=additions+deletions))
 
 echo "[$$] Done in $((EPOCHSECONDS - start_time)) seconds..."
 
-trap 'catch_sig' SIGTERM SIGINT SIGHUP
+
 if ((changes>0));then
 	echo "[$$] New data detected, keeping $additions addition(s) and $deletions deletion(s)..."
 else
 	echo "[$$] No changes, purging new data..."
-	execute_sql "delete from stats where run_date=$run_date;"
+	start_time=$EPOCHSECONDS
+	deleted=$(execute_sql "delete from stats where run_date=$run_date;select changes();")
+	echo "[$$] Deleted $deleted records from stats..."
+	# To delete this run, we have to do a reference count to the data, if the id is used more than once, then do not delete the data from masternodes table.
+	# Find all masternode records that are referenced once only, then select those that are also from this run_date and delete them.
+	deleted=$(execute_sql "delete from masternodes where id in (select id from masternode_id_run_date where run_date=$run_date and id in(select id from masternode_id_run_date group by id having count(1)=1));select changes();")
+	echo "[$$] Deleted $deleted records from masternodes..."
+	deleted=$(execute_sql "delete from masternode_id_run_date where run_date=$run_date;select changes();")
+	echo "[$$] Deleted $deleted records from masternode_id_run_date..."
+
 #	echo "[$$] Doing a VACUUM..."
 #	execute_sql "vacuum;"
+	echo "[$$] Purge completed in $((EPOCHSECONDS - start_time)) seconds."
 fi
 execute_sql "delete from loading where run_date=$run_date;"
-[[ -n $got_sig ]]&& exit 9
+
 trap - SIGTERM SIGINT SIGHUP
 
 if ((changes>0));then
@@ -410,7 +429,7 @@ if ((changes>0));then
 	# This will be a good time to take a backup of the database.
 	start_time=$EPOCHSECONDS
 	echo "[$$] Backing up the database..."
-	BACKUP_DB="$(dirname "$DATABASE_FILE")/"$run_date"_stats.db"
+	BACKUP_DB="$(dirname "$DATABASE_FILE")/${run_date}_stats.db"
 	cp "$DATABASE_FILE" "$BACKUP_DB"
 	xz -eT5 "$BACKUP_DB" >/dev/null 2>&1
 	echo "[$$] Done in $((EPOCHSECONDS - start_time)) seconds..."
