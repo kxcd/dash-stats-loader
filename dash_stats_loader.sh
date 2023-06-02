@@ -1,8 +1,8 @@
 #!/bin/bash
 #set -x
 
-VERSION="$0 (v0.3.0 build date 202208311800)"
-DATABASE_VERSION=2
+VERSION="$0 (v0.4.1 build date 20230602230)"
+DATABASE_VERSION=3
 DATADIR="$HOME/.dash_stats_loader"
 
 dcli () {
@@ -22,6 +22,8 @@ usage(){
 	echo -e "$text"
 }
 
+
+
 # Parse commandline options and set flags.
 while (( $# > 0 ));do
 	arg="$1"
@@ -32,7 +34,7 @@ while (( $# > 0 ));do
 			exit 0
 			;;
 		-datadir)
-			datadir="$2"
+			DATADIR="$2"
 			shift;shift
 			;;
 		*)
@@ -44,9 +46,7 @@ done
 
 echo "[$$] Starting $VERSION." >&2
 
-
-
-# Now we are safe to use variables like NETWORK and DATADIR, so let's compute a database_file
+# Now we are safe to use variables like DATADIR, so let's compute a database_file
 DATABASE_FILE="$DATADIR/database/stats.db"
 
 
@@ -68,9 +68,6 @@ check_dependencies(){
 
 make_datadir(){
 
-	# If a custom datadir is passed in, use it.
-	[[ -n $1 ]] && DATADIR="$1"
-
 	if [[ ! -d "$DATADIR" ]];then
 		mkdir -p "$DATADIR"/{database,logs}
 		if (( $? != 0 ));then
@@ -85,7 +82,7 @@ make_datadir(){
 execute_sql(){
 
 	[[ -z $1 ]] && return
-	for((i=1; i<100; i++));do
+	for((i=1; i<3; i++));do
 		sqlite3 "$DATABASE_FILE" <<< "$1" 2>>"$DATADIR"/logs/sqlite.log && return
 		retval=$?
 		echo "[$$] Failed query attempt number: $i." >>"$DATADIR"/logs/sqlite.log
@@ -106,20 +103,26 @@ initialise_database(){
 	if [[ ! -f "$DATABASE_FILE" ]];then
 		# Create db objects.
 		# STATS						-	Stores a snapshot of the dash network.
-		#			run_date					-	The date/time of execution in yyyymmddHHmiss format.
-		#			height						-	The reported blockchain height
-		#			chainlocked_YN				-	Mandatory, choice of 'Y' for chainlocked block, 'N' for no chainlock found.
-		#			chainlock_lag				-	Number of blocks since the last chainlock was recorded.
-		#			difficulty_mega				-	Mining difficulty reported in the millions.
-		#			supply_mega					-	Number of coins ever minted in millions
-		#			mempool_txes				-	Number of transactions in the mempool.
-		#			mempool_size_kb				-	The size of the mempool in kilobytes.
-		#			tx_rate						-	The average number of transactions per second seen in the last hour.
-		#			collateralised_masternodes	-	The number of masternodes locking away 1000 DASH.
-		#			enabled_masternodes			-	The number of masternodes that are actually running.
-		#			price_usd					-	Sourced from coinpaprika.
-		#			price_btc					-	Sourced from coinpaprika.
-		#			price_usd_24hr_change		-	The percent gain/loss in the USD price in the last 24 hours.
+		#			run_date						-	The date/time of execution in yyyymmddHHmiss format.
+		#			height							-	The reported blockchain height
+		#			chainlocked_YN					-	Mandatory, choice of 'Y' for chainlocked block, 'N' for no chainlock found.
+		#			chainlock_lag					-	Number of blocks since the last chainlock was recorded.
+		#			difficulty_mega					-	Mining difficulty reported in the millions.
+		#			supply_mega						-	Number of coins ever minted in millions
+		#			mempool_txes					-	Number of transactions in the mempool.
+		#			mempool_size_kb					-	The size of the mempool in kilobytes.
+		#			tx_rate							-	The average number of transactions per second seen in the last hour.
+		#			collateralised_1k_masternodes	-	The number of masternodes locking away 1000 DASH.
+		#			enabled_1k_masternodes			-	The number of 1k masternodes that are actually running.
+		#			collateralised_4k_masternodes	-	The number of masternodes locking away 4000 DASH.
+		#			enabled_4k_masternodes			-	The number of 4k masternodes that are actually running.
+		#			mn_1k_days						-	The average age since protx rego of a 1k MN.
+		#			mn_1k_collateral_days			-	The average age since collateralisation of a 1k MN.
+		#			mn_4k_days						-	The average age since protx rego of a 4k MN.
+		#			mn_4k_collateral_days			-	The average age since collateralisation of a 4k MN.
+		#			price_usd						-	Sourced from coinpaprika.
+		#			price_btc						-	Sourced from coinpaprika.
+		#			price_usd_24hr_change			-	The percent gain/loss in the USD price in the last 24 hours.
 		#
 		# masternodes				-	Stores a snapshot of the masternode network at that point in time.
 		# masternode_id_run_date	-	Stores the run_date and the masternode id only.
@@ -129,10 +132,10 @@ initialise_database(){
 		#
 		sql="PRAGMA foreign_keys = ON;"
 		sql+="create table db_version(version integer primary key not null);"
-		sql+="insert into db_version values(2);"
-		sql+="create table STATS(run_date INTEGER PRIMARY KEY ASC NOT NULL, height INTEGER NOT NULL check(height>=0),chainlocked_YN text not null ,chainlock_lag integer not null,difficulty_mega real not null check(difficulty_mega>=0), supply_mega real not null check(supply_mega>=0), mempool_txes integer not null check(mempool_txes>=0), mempool_size_kb real not null check(mempool_size_kb>=0), tx_rate real not null check(tx_rate>=0), collateralised_masternodes integer not null check(collateralised_masternodes>=0), enabled_masternodes integer not null check(enabled_masternodes>=0), price_usd real not null check(price_usd>=0), price_btc real not null check(price_btc>=0), price_usd_24hr_change real not null, mn_days real not null);"
+		sql+="insert into db_version values(3);"
+		sql+="create table stats(run_date INTEGER PRIMARY KEY ASC NOT NULL,height INTEGER NOT NULL check(height>=0),chainlocked_YN text not null,chainlock_lag integer not null,difficulty_mega real not null check(difficulty_mega>=0),supply_mega real not null check(supply_mega>=0), mempool_txes integer not null check(mempool_txes>=0),mempool_size_kb real not null check(mempool_size_kb>=0), tx_rate real not null check(tx_rate>=0),collateralised_1k_masternodes integer not null check(collateralised_1k_masternodes>=0),enabled_1k_masternodes integer not null check(enabled_1k_masternodes>=0),collateralised_4k_masternodes integer not null check(collateralised_4k_masternodes>=0),enabled_4k_masternodes integer not null check(enabled_4k_masternodes>=0),mn_1k_days real,mn_1k_collateral_days real,mn_4k_days real not null,mn_4k_collateral_days real not null,price_usd real not null check(price_usd>=0), price_btc real not null check(price_btc>=0), price_usd_24hr_change real not null);"
 		sql+="create unique index idx_run_date on STATS(run_date);"
-		sql+="CREATE TABLE masternodes(id integer primary key asc not null, protx_hash text not null, collateral_hash text not null, collateral_hash_index integer not null,ip text not null, port integer not null check(port>=0 and port<65536),status text not null check(status in('E','P','U')),owner_address text not null,voting_address text not null, payout_address text not null,collateral_address text not null);"
+		sql+="CREATE TABLE masternodes(id integer primary key asc not null, protx_hash text not null, collateral_hash text not null, collateral_hash_index integer not null,ip text not null, port integer not null check(port>=0 and port<65536),status text not null check(status in('E','P','U')),mn_type integer not null check(mn_type in(1,4)),owner_address text not null,voting_address text not null, payout_address text not null,collateral_address text not null);"
 		# This index is handy to have, but strictly not needed to run the PHP site.
 		sql+="CREATE INDEX idx_collateral_hash_index on MASTERNODES(collateral_hash,collateral_hash_index);"
 		sql+="CREATE TABLE masternode_id_run_date(id int not null, run_date int not null, primary key(id,run_date),foreign key(id)references masternodes,foreign key(run_date)references stats(run_date));"
@@ -186,9 +189,9 @@ check_and_upgrade_database(){
 		exit 7
 	fi
 	missing=$(execute_sql "select count(1) from masternodes a where not exists (select 1 from masternode_id_run_date b where a.id=b.id);")
-	((missing>0))&&{ echo "[$$] There are $missing records in the masternodes table.";exit 2;}
+	((missing>0))&&{ echo "[$$] There are $missing unlinked record(s) in the masternodes table.";exit 2;}
 	missing=$(execute_sql "select count(1) from masternode_id_run_date a where not exists (select 1 from masternodes b where a.id=b.id);")
-	((missing>0))&&{ echo "[$$] There are $missing records in the masternode_id_run_date table.";exit 2;}
+	((missing>0))&&{ echo "[$$] There are $missing unlinked record(s) in the masternode_id_run_date table.";exit 2;}
 	pages=$(execute_sql "select count(1) from stats;")
 	mn_pages=$(execute_sql "select count(distinct run_date) from masternode_id_run_date;")
 	masternodes=$(execute_sql "select count(1) from masternodes;")
@@ -218,9 +221,9 @@ catch_sig(){
 echo "[$$] Checking program dependencies..."
 check_dependencies
 
-# $datadir can get set by a commandline option.
-echo "[$$] Checking datadir $datadir..."
-make_datadir "$datadir"
+# $DATADIR can get (re)set by a commandline option.
+echo "[$$] Checking datadir $DATADIR..."
+make_datadir
 
 echo "[$$] Initialising database..."
 initialise_database
@@ -283,19 +286,29 @@ tx_rate=$(printf '%0.4f' $(bc<<<"scale=6;$num_txes / $diff_time"))
 
 echo "[$$] Fetching masternode counts..."
 mn_count=$(dcli masternode count)
-collateralised_masternodes=$(jq .total <<< "$mn_count")
-enabled_masternodes=$(jq .enabled <<< "$mn_count")
+collateralised_1k_masternodes=$(jq .detailed.regular.total <<< "$mn_count")
+enabled_1k_masternodes=$(jq .detailed.regular.enabled <<< "$mn_count")
+collateralised_4k_masternodes=$(jq .detailed.hpmn.total <<< "$mn_count")
+enabled_4k_masternodes=$(jq .detailed.hpmn.enabled <<< "$mn_count")
 
 # Collect the masternode data, but it gets used a little later.
 masternodes=$(dcli masternode list)
 
 
-echo "[$$] Fetching masternode days..."
+echo "[$$] Fetching 1k masternode days..."
 protx_list=$(dcli protx list valid 1)
-mn_days=$(jq '.[].state.registeredHeight'<<<"$protx_list"| awk -v height="$height" '{sum+=height-$1}END{print sum/NR*2.625/60/24}')
+mn_1k_days=$(jq '.[] | select(.type == "Regular")'<<<"$protx_list"|jq '.state.registeredHeight'|awk -v height="$height" '{sum+=height-$1}END{print sum/NR*2.625/60/24}')
+echo "[$$] Fetching 1k masternode collateral days..."
+mn_1k_collateral_days=$(while read tx;do start_time=$(dcli getrawtransaction $tx 1|jq .time);echo $((EPOCHSECONDS-start_time));done < <(jq -r  '.[]| select(.type == "Regular") |.collateralHash'<<< "$protx_list")|awk '{sum+=$1}END{print sum/NR/60/60/24}')
 
-
-
+echo "[$$] Fetching 4k masternode days..."
+if (( collateralised_4k_masternodes == 0));then
+	mn_4k_days=0
+	mn_4k_collateral_days=0
+else
+	mn_4k_days=$(jq '.[] | select(.type == "HighPerformance")'<<<"$protx_list"|jq '.state.registeredHeight'|awk -v height="$height" '{sum+=height-$1}END{print sum/NR*2.625/60/24}')
+	mn_4k_collateral_days=$(while read tx;do start_time=$(dcli getrawtransaction $tx 1|jq .time);echo $((EPOCHSECONDS-start_time));done < <(jq -r  '.[]| select(.type == "HighPerformance") |.collateralHash'<<< "$protx_list")|awk '{sum+=$1}END{print sum/NR/60/60/24}')
+fi
 
 
 
@@ -334,7 +347,7 @@ if ((loading_count >1));then
 	exit 99
 fi
 
-sql="insert into stats (run_date,height,chainlocked_YN,chainlock_lag,difficulty_mega,supply_mega,mempool_txes,mempool_size_kb,tx_rate,collateralised_masternodes,enabled_masternodes,price_usd,price_btc,price_usd_24hr_change,mn_days)values($run_date,$height,\"$chainlocked_YN\",$chainlock_lag,$difficulty_mega,$supply_mega,$mempool_txes,$mempool_size_kb,$tx_rate,$collateralised_masternodes,$enabled_masternodes,$price_usd,$price_btc,$price_usd_24hr_change,$mn_days);"
+sql="insert into stats (run_date,height,chainlocked_YN,chainlock_lag,difficulty_mega,supply_mega,mempool_txes,mempool_size_kb,tx_rate,collateralised_1k_masternodes,enabled_1k_masternodes,collateralised_4k_masternodes,enabled_4k_masternodes,mn_1k_days,mn_1k_collateral_days,mn_4k_days,mn_4k_collateral_days,price_usd,price_btc,price_usd_24hr_change)values($run_date,$height,\"$chainlocked_YN\",$chainlock_lag,$difficulty_mega,$supply_mega,$mempool_txes,$mempool_size_kb,$tx_rate,$collateralised_1k_masternodes,$enabled_1k_masternodes,$collateralised_4k_masternodes,$enabled_4k_masternodes,$mn_1k_days,$mn_1k_collateral_days,$mn_4k_days,$mn_4k_collateral_days,$price_usd,$price_btc,$price_usd_24hr_change);"
 execute_sql "$sql"
 
 
@@ -343,17 +356,29 @@ start_time=$EPOCHSECONDS
 
 key=0
 collateral_hashes_array=($(jq -r 'keys_unsorted[]'<<<"$masternodes"))
-while read proTxHash address status owner_address voting_address payee collateraladdress rest;do
-	case $status in
+while read protx_hash address mn_status mn_type owner_address voting_address payout_address collateral_address rest;do
+	case $mn_status in
 		ENABLED)
-			status="E"
+			mn_status="E"
 			;;
 		POSE_BANNED)
-			status="P"
+			mn_status="P"
 			;;
 		*)
-			echo "*** Unhandled masternode status $status ***" 1>&2
-			status="U"
+			echo "*** Unhandled masternode status $mn_status ***" 1>&2
+			mn_status="U"
+			;;
+	esac
+	case $mn_type in
+		Regular)
+			mn_type=1
+			;;
+		HighPerformance)
+			mn_type=4
+			;;
+		*)
+			echo "*** Unhandled masternode type $mn_type ***" 1>&2
+			mn_type=0
 			;;
 	esac
 	if (( ${#address} <7));then
@@ -367,24 +392,19 @@ while read proTxHash address status owner_address voting_address payee collatera
 	collateral_hash_index=${collateral_hashes_array[$key]#*-}
 	((key++))
 
-	while :;do
-		sql="select id from masternodes where protx_hash='$proTxHash' and collateral_hash='$collateral_hash' and collateral_hash_index=$collateral_hash_index and ip='$ip' and port=$port and status='$status' and owner_address='$owner_address' and voting_address='$voting_address' and payout_address='$payee' and collateral_address='$collateraladdress';"
-		id=$(execute_sql "$sql")
-		if [[ $id == "" ]];then
-			echo -n "*"
-			execute_sql "insert into masternodes(protx_hash,collateral_hash,collateral_hash_index,ip,port,status,owner_address,voting_address,payout_address,collateral_address) values('$proTxHash','$collateral_hash',$collateral_hash_index,'$ip',$port,'$status','$owner_address','$voting_address','$payee','$collateraladdress');"
-		else
-			break;
-		fi
-	done
-	echo -n "#"
+	get_id_sql="select id from masternodes where protx_hash='$protx_hash' and collateral_hash='$collateral_hash' and collateral_hash_index=$collateral_hash_index and ip='$ip' and port=$port and status='$mn_status' and mn_type=$mn_type and owner_address='$owner_address' and voting_address='$voting_address' and payout_address='$payout_address' and collateral_address='$collateral_address';"
+	id=$(execute_sql "$get_id_sql")
+	if [[ $id == "" ]];then
+		echo -n "*"
+		execute_sql "insert into masternodes(protx_hash,collateral_hash,collateral_hash_index,ip,port,status,mn_type,owner_address,voting_address,payout_address,collateral_address) values('$protx_hash','$collateral_hash',$collateral_hash_index,'$ip',$port,'$mn_status',$mn_type,'$owner_address','$voting_address','$payout_address','$collateral_address');"
+		id=$(execute_sql "$get_id_sql")
+	else
+		echo -n "#"
+	fi
 	execute_sql "insert into masternode_id_run_date values($id,$run_date);"
-done  < <(jq -r '.[]|"\(.proTxHash) \(.address) \(.status) \(.owneraddress) \(.votingaddress) \(.payee) \(.collateraladdress)"'<<<"$masternodes")
+done  < <(jq -r '.[]|"\(.proTxHash) \(.address) \(.status) \(.type) \(.owneraddress) \(.votingaddress) \(.payee) \(.collateraladdress)"'<<<"$masternodes")
 
 echo -e "\n[$$] Done Loading masternodes database in $((EPOCHSECONDS - start_time)) seconds..."
-
-
-
 
 
 echo "[$$] Checking masternodes database for differences..."
